@@ -143,55 +143,131 @@ function listParams(context: ShareContext, shareId: string, dir?: string): URLSe
  * The landing fetch follows redirects, so a single request covers short-link
  * expansion and the page HTML together.
  */
+
 export async function openShare(
   link: string,
   cookie: string,
   budget: Budget,
 ): Promise<ShareContext> {
-  const response = await budget.fetch(link, {
-    headers: { ...BASE_HEADERS, Cookie: cookie },
-    redirect: "follow",
-  });
+  const inputUrl = new URL(link);
+  const shareId = extractShareId(inputUrl);
 
-  if (response.status === 404 || response.status === 410) {
-    throw ApiError.notFound("That share link doesn't exist or has been deleted.");
-  }
-  if (!response.ok) {
-    throw ApiError.upstream(`Failed to open the share link (status ${response.status}).`, {
-      status: response.status,
-    });
-  }
-
-  const resolvedUrl = response.url || link;
-  const html = await response.text();
-
-  let shareId: string | null = null;
-  for (const candidate of [resolvedUrl, link]) {
-    try {
-      shareId = extractShareId(new URL(candidate));
-    } catch {
-      shareId = null;
-    }
-    if (shareId) break;
-  }
   if (!shareId) {
     throw ApiError.upstreamUnexpected(
       "Could not find a share id on that link. Check the URL was copied in full.",
     );
   }
 
-  return {
-    shareId,
-    origin: new URL(resolvedUrl).origin,
-    resolvedUrl,
-    jsToken: extractJsToken(html),
-    logId: extractLogId(html),
-    record: extractShareRecord(html),
-    cookie,
-    html,
-    passwordGate: looksPasswordProtected(html),
-  };
+  const surl = shareId.replace(/^1/, "");
+
+  const candidates = [
+    link,
+    ...MIRROR_ORIGINS.flatMap((origin) => [
+      `${origin}/s/${shareId}`,
+      `${origin}/wap/share/filelist?surl=${encodeURIComponent(surl)}`,
+    ]),
+  ];
+
+  const uniqueCandidates = [...new Set(candidates)];
+
+  let lastStatus: number | null = null;
+  let lastError: unknown = null;
+  let sawNotFound = false;
+
+  for (const candidate of uniqueCandidates) {
+    if (!budget.canAfford(2)) break;
+
+    try {
+      const isMobile = candidate.includes("/wap/");
+
+      const response = await budget.fetch(candidate, {
+        headers: {
+          ...BASE_HEADERS,
+          "User-Agent": isMobile ? MOBILE_UA : BROWSER_UA,
+          Cookie: cookie,
+          Referer: new URL(candidate).origin + "/",
+        },
+        redirect: "follow",
+        retries: 0,
+      });
+
+      lastStatus = response.status;
+
+      if (response.status === 404 || response.status === 410) {
+        sawNotFound = true;
+        log("warn", "share landing unavailable", {
+          origin: new URL(candidate).origin,
+          status: response.status,
+        });
+        continue;
+      }
+
+      if (!response.ok) {
+        log("warn", "share landing request failed", {
+          origin: new URL(candidate).origin,
+          status: response.status,
+        });
+        continue;
+      }
+
+      const html = await response.text();
+
+      if (!html.trim()) {
+        continue;
+      }
+
+      const resolvedUrl = response.url || candidate;
+
+      // Keep the ID from the original link, even when
+      // a mirror redirects to a different landing page.
+      const context: ShareContext = {
+        shareId,
+        origin: new URL(resolvedUrl).origin,
+        resolvedUrl,
+        jsToken: extractJsToken(html),
+        logId: extractLogId(html),
+        record: extractShareRecord(html),
+        cookie,
+        html,
+        passwordGate: looksPasswordProtected(html),
+      };
+
+      log("info", "share landing fetched", {
+        origin: context.origin,
+        mobile: isMobile,
+        has_token: Boolean(context.jsToken),
+      });
+
+      return context;
+    } catch (error) {
+      lastError = error;
+
+      log("warn", "share landing fetch exception", {
+        origin: new URL(candidate).origin,
+        message: error instanceof Error ? error.message : "unknown",
+      });
+    }
+  }
+
+  if (!budget.canAfford()) {
+    throw ApiError.budgetExhausted();
+  }
+
+  if (sawNotFound && lastStatus !== null) {
+    throw ApiError.notFound(
+      "TeraBox returned 404/410 for the attempted share pages. The share may be accessible in a browser but unavailable to this server.",
+    );
+  }
+
+  throw ApiError.upstream(
+    `Unable to open the share through available TeraBox domains. Last status: ${lastStatus ?? "unknown"}.`,
+    {
+      status: lastStatus,
+      reason: lastError instanceof Error ? lastError.message : "unknown",
+    },
+  );
 }
+
 
 /** Exchange a share password for the `randsk` unlock key. */
 export async function unlockShare(
