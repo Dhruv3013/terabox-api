@@ -355,12 +355,11 @@ async function callList(
       if (data.errno) {
         lastError = fromTeraboxErrno(data.errno, data.errmsg);
         // A password gate or a missing share is final — no mirror will differ.
-        if (
-          lastError.code === ErrorCode.PASSWORD_REQUIRED ||
-          lastError.code === ErrorCode.NOT_FOUND
-        ) {
-          throw lastError;
-        }
+        
+       if (lastError.code === ErrorCode.PASSWORD_REQUIRED) {
+  throw lastError;
+}
+
         continue;
       }
 
